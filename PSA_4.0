@@ -1,0 +1,506 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <time.h>
+#include <Keypad.h>
+#include <SD.h>
+#include <FS.h>
+#include <esp_task_wdt.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===== RFID =====
+#define SS_PIN 10
+#define RST_PIN 9
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// ===== BUZZER =====
+#define BUZZER_PIN 2
+
+// ===== MICROSD SPI SEPARADO =====
+#define SD_CS   47
+#define SD_SCK  21
+#define SD_MOSI 20
+#define SD_MISO 19
+SPIClass spiSD(HSPI);
+
+// ===== WIFI =====
+const char* ssid = "Jozze111";
+const char* password = "Jozze111";
+
+// ===== NTP =====
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 0;
+const int daylightOffset_sec = 3600;
+
+// ===== KEYPAD =====
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {42, 41, 40, 39};
+byte colPins[COLS] = {38, 37, 36, 35};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ===== UTILIZADORES =====
+struct Utilizador {
+  String uid;
+  String nome;
+};
+
+Utilizador utilizadores[] = {
+  {"A7272049",       "Joao"},
+  {"F11FB7C1",       "Mariana"},
+  {"47B2BCAAC1690",  "Alexandre"},
+  {"413BF22161E95",  "Andre"}
+};
+
+int totalUtilizadores = sizeof(utilizadores) / sizeof(utilizadores[0]);
+
+// ===== HORÁRIO =====
+int horaLimite   = 12;
+int minutoLimite = 25;
+
+// ===== MOTIVOS DE ATRASO =====
+String motivosAtraso[] = {
+  "",
+  "Autocarro atrasado",
+  "Fila no bar",
+  "Sai tarde de casa",
+  "Transito"
+};
+
+// ===== HISTÓRICO EM RAM =====
+struct Registo {
+  String texto;
+  int    humor;
+  String motivo;
+};
+
+Registo historico[20];
+int totalRegistos = 0;
+
+// ===== SERVER =====
+WiFiServer server(80);
+
+// ===== PROTÓTIPOS =====
+void tratarPedidoWeb(WiFiClient client);
+
+// ===== BUZZER =====
+void bip(int vezes, int duracao = 100) {
+  for (int i = 0; i < vezes; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(duracao);
+    digitalWrite(BUZZER_PIN, LOW);
+    if (i < vezes - 1) delay(100);
+  }
+}
+
+// ===== HORA =====
+String getHora() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "Erro";
+  char hora[10];
+  strftime(hora, sizeof(hora), "%H:%M", &timeinfo);
+  return String(hora);
+}
+
+String getDataHora() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "Erro";
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &timeinfo);
+  return String(buf);
+}
+
+// ===== HUMOR =====
+int charParaHumor(char c) {
+  switch (c) {
+    case 'A': return 3;
+    case 'B': return 2;
+    case 'C': return 1;
+    case 'D': return 0;
+    default:  return 2;
+  }
+}
+
+String getNomeHumor(int humor) {
+  switch (humor) {
+    case 0: return "Mau";
+    case 1: return "Razoavel";
+    case 2: return "Bom";
+    case 3: return "Otimo";
+    default: return "Bom";
+  }
+}
+
+String getCorHumor(int humor) {
+  switch (humor) {
+    case 0: return "#ff4c4c";
+    case 1: return "#ffaa00";
+    case 2: return "#00ccff";
+    case 3: return "#00ff88";
+    default: return "#00ccff";
+  }
+}
+
+// ===== SD =====
+void gravarNoSD(String linha) {
+  File f = SD.open("/registos.csv", FILE_APPEND);
+  if (f) {
+    f.println(linha);
+    f.close();
+    Serial.println("Gravado no SD: " + linha);
+  } else {
+    Serial.println("Erro ao abrir ficheiro no SD!");
+  }
+}
+
+String lerRegistosSD() {
+  String resultado = "";
+  File f = SD.open("/registos.csv", FILE_READ);
+  if (!f) return resultado;
+  while (f.available()) {
+    resultado += (char)f.read();
+  }
+  f.close();
+  return resultado;
+}
+
+// ===== GERAR CONTEÚDO HTML =====
+String gerarConteudo() {
+  String html = "";
+
+  int totalOK     = 0;
+  int totalAtraso = 0;
+  int totalNegado = 0;
+  int somaHumor   = 0;
+  int countHumor  = 0;
+
+  for (int i = 0; i < 20; i++) {
+    if (historico[i].texto != "") {
+      if      (historico[i].texto.indexOf("OK")       > 0) totalOK++;
+      else if (historico[i].texto.indexOf("ATRASADO") > 0) totalAtraso++;
+      else                                                   totalNegado++;
+      somaHumor += historico[i].humor;
+      countHumor++;
+    }
+  }
+
+  html += "<div class='box'><h2>Resumo</h2>";
+  html += "<p class='ok'>Presentes: "     + String(totalOK)     + "</p>";
+  html += "<p class='atraso'>Atrasados: " + String(totalAtraso) + "</p>";
+  html += "<p class='negado'>Negados: "   + String(totalNegado) + "</p>";
+  if (countHumor > 0) {
+    float media = (float)somaHumor / countHumor;
+    char mediaStr[5];
+    dtostrf(media, 3, 1, mediaStr);
+    html += "<p style='color:#00ccff;'>Humor medio da turma: " + String(mediaStr) + " / 3</p>";
+  }
+  html += "</div>";
+
+  if (totalRegistos > 0) {
+    Registo ultimo = historico[(totalRegistos - 1 + 20) % 20];
+    String cor = getCorHumor(ultimo.humor);
+    html += "<div class='box'><h2>Ultimo acesso</h2>";
+    if      (ultimo.texto.indexOf("ATRASADO") > 0) html += "<p class='atraso'>" + ultimo.texto + "</p>";
+    else if (ultimo.texto.indexOf("OK")       > 0) html += "<p class='ok'>"     + ultimo.texto + "</p>";
+    else                                            html += "<p class='negado'>" + ultimo.texto + "</p>";
+    if (ultimo.motivo != "")
+      html += "<p class='atraso'>Motivo: " + ultimo.motivo + "</p>";
+    html += "<p style='color:" + cor + ";'>Estado de espirito: " + getNomeHumor(ultimo.humor) + "</p>";
+    html += "</div>";
+  }
+
+  html += "<div class='box'><h2>Historico (sessao atual)</h2><table>";
+  html += "<tr><th>Registo</th><th>Motivo Atraso</th><th>Humor</th></tr>";
+  for (int i = 0; i < 20; i++) {
+    if (historico[i].texto != "") {
+      String cor      = getCorHumor(historico[i].humor);
+      String classeTd = "";
+      if      (historico[i].texto.indexOf("ATRASADO") > 0) classeTd = "atraso";
+      else if (historico[i].texto.indexOf("OK")       > 0) classeTd = "ok";
+      else                                                   classeTd = "negado";
+      html += "<tr>";
+      html += "<td class='" + classeTd + "'>" + historico[i].texto + "</td>";
+      html += "<td class='atraso'>" + (historico[i].motivo != "" ? historico[i].motivo : "-") + "</td>";
+      html += "<td style='color:" + cor + ";'>" + getNomeHumor(historico[i].humor) + "</td>";
+      html += "</tr>";
+    }
+  }
+  html += "</table></div>";
+  return html;
+}
+
+// ===== SERVIR PÁGINA PRINCIPAL =====
+void servirPaginaPrincipal(WiFiClient client) {
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html; charset=UTF-8");
+  client.println("Cache-Control: no-cache");
+  client.println("Connection: close");
+  client.println();
+  client.println("<!DOCTYPE html><html><head><meta charset='UTF-8'>");
+  client.println("<title>Presenca em Sala de Aula</title>");
+  client.println("<style>");
+  client.println("body{font-family:Arial;background:#1e1e2f;color:white;text-align:center;margin:0;padding:20px;}");
+  client.println("h1{margin-bottom:20px;}h2{color:#aaaaff;}");
+  client.println(".box{background:#2c2c3e;margin:20px auto;padding:20px;border-radius:10px;max-width:700px;}");
+  client.println(".ok{color:#00ff88;}.atraso{color:#ff4c4c;}.negado{color:#ffaa00;}");
+  client.println("table{width:100%;border-collapse:collapse;}");
+  client.println("th{padding:10px;border-bottom:2px solid #666;color:#aaaaff;}");
+  client.println("td{padding:10px;border-bottom:1px solid #444;text-align:left;}");
+  client.println("a.btn{display:inline-block;margin:10px;padding:10px 20px;background:#444;color:white;border-radius:8px;text-decoration:none;}");
+  client.println("a.btn:hover{background:#666;}");
+  client.println("</style>");
+  client.println("<script>");
+  client.println("window.onload=function(){setInterval(function(){fetch('/dados').then(function(r){return r.text();}).then(function(d){if(d.indexOf('<h1>')===-1){document.getElementById('conteudo').innerHTML=d;}});},2000);};");
+  client.println("</script>");
+  client.println("</head><body>");
+  client.println("<h1>PRESENCA EM SALA DE AULA</h1>");
+  client.println("<a class='btn' href='/sd'>Ver registos do SD</a>");
+  client.println("<div id='conteudo'>");
+  client.println(gerarConteudo());
+  client.println("</div></body></html>");
+  client.stop();
+}
+
+// ===== SERVIR PÁGINA SD =====
+void servirPaginaSD(WiFiClient client) {
+  String dados = lerRegistosSD();
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html; charset=UTF-8");
+  client.println("Cache-Control: no-cache");
+  client.println("Connection: close");
+  client.println();
+  client.println("<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Registos SD</title>");
+  client.println("<style>");
+  client.println("body{font-family:Arial;background:#1e1e2f;color:white;text-align:center;margin:0;padding:20px;}");
+  client.println("h1{margin-bottom:20px;}");
+  client.println(".box{background:#2c2c3e;margin:20px auto;padding:20px;border-radius:10px;max-width:900px;text-align:left;}");
+  client.println("table{width:100%;border-collapse:collapse;}");
+  client.println("th{padding:10px;border-bottom:2px solid #666;color:#aaaaff;}");
+  client.println("td{padding:8px;border-bottom:1px solid #444;}");
+  client.println(".ok{color:#00ff88;}.atraso{color:#ff4c4c;}.negado{color:#ffaa00;}");
+  client.println("a.btn{display:inline-block;margin:10px;padding:10px 20px;background:#444;color:white;border-radius:8px;text-decoration:none;}");
+  client.println("</style></head><body>");
+  client.println("<h1>Registos no MicroSD</h1>");
+  client.println("<a class='btn' href='/'>Voltar</a>");
+  client.println("<a class='btn' href='/download'>Download CSV</a>");
+  client.println("<div class='box'><table>");
+  client.println("<tr><th>Data/Hora</th><th>Nome</th><th>Estado</th><th>Motivo</th><th>Humor</th></tr>");
+
+  int start = 0;
+  while (start < (int)dados.length()) {
+    int end = dados.indexOf('\n', start);
+    if (end == -1) end = dados.length();
+    String linha = dados.substring(start, end);
+    linha.trim();
+    if (linha.length() > 0) {
+      String cols[5];
+      int ci = 0, ls = 0;
+      for (int j = 0; j <= (int)linha.length() && ci < 5; j++) {
+        if (j == (int)linha.length() || linha[j] == ',') {
+          cols[ci++] = linha.substring(ls, j);
+          ls = j + 1;
+        }
+      }
+      String classe = (cols[2] == "OK") ? "ok" : (cols[2] == "ATRASADO") ? "atraso" : "negado";
+      client.println("<tr>");
+      for (int j = 0; j < 5; j++) {
+        if (j == 2) client.println("<td class='" + classe + "'>" + cols[j] + "</td>");
+        else        client.println("<td>" + cols[j] + "</td>");
+      }
+      client.println("</tr>");
+    }
+    start = end + 1;
+  }
+
+  client.println("</table></div></body></html>");
+  client.stop();
+}
+
+// ===== SERVIR DOWNLOAD CSV =====
+void servirDownloadCSV(WiFiClient client) {
+  String dados = lerRegistosSD();
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/csv; charset=UTF-8");
+  client.println("Content-Disposition: attachment; filename=registos.csv");
+  client.println("Connection: close");
+  client.println();
+  client.print(dados);
+  client.stop();
+}
+
+// ===== TRATAR PEDIDO WEB =====
+void tratarPedidoWeb(WiFiClient client) {
+  String request = "";
+  while (client.connected() && client.available()) {
+    char c = client.read();
+    request += c;
+    if (request.endsWith("\r\n\r\n")) break;
+  }
+  if (request.startsWith("GET /dados")) {
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/html; charset=UTF-8");
+    client.println("Cache-Control: no-cache");
+    client.println("Connection: close");
+    client.println();
+    client.println(gerarConteudo());
+    client.stop();
+  } else if (request.startsWith("GET /sd"))       servirPaginaSD(client);
+  else if (request.startsWith("GET /download"))   servirDownloadCSV(client);
+  else                                             servirPaginaPrincipal(client);
+}
+
+// ===== SETUP =====
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+  Serial.begin(115200);
+
+  // Watchdog 30 segundos
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000,
+    .idle_core_mask = 0,
+    .trigger_panic = false
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  SPI.begin(12, 13, 11, 10);
+  rfid.PCD_Init();
+
+  spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, spiSD)) {
+    Serial.println("Erro ao iniciar MicroSD!");
+  } else {
+    Serial.println("MicroSD OK!");
+    if (!SD.exists("/registos.csv")) {
+      File f = SD.open("/registos.csv", FILE_WRITE);
+      if (f) { f.println("DataHora,Nome,Estado,Motivo,Humor"); f.close(); }
+    }
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Ligando WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    esp_task_wdt_reset();
+  }
+  Serial.println("\nWiFi ligado!");
+  Serial.println(WiFi.localIP());
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  server.begin();
+  bip(2, 150);
+  Serial.println("Passe o cartao...");
+}
+
+// ===== LOOP =====
+void loop() {
+
+  esp_task_wdt_reset();
+
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+
+    bip(1, 80);
+
+    String uid = "";
+    for (byte i = 0; i < rfid.uid.size; i++) uid += String(rfid.uid.uidByte[i], HEX);
+    uid.toUpperCase();
+    uid.trim();
+    Serial.println("UID: " + uid);
+
+    String horaAtual = getHora();
+    String dataHora  = getDataHora();
+    String nome      = "DESCONHECIDO";
+    String estado    = "NEGADO";
+
+    int hora   = horaAtual.substring(0, 2).toInt();
+    int minuto = horaAtual.substring(3, 5).toInt();
+
+    for (int i = 0; i < totalUtilizadores; i++) {
+      if (uid == utilizadores[i].uid) {
+        nome = utilizadores[i].nome;
+        estado = (hora < horaLimite || (hora == horaLimite && minuto <= minutoLimite)) ? "OK" : "ATRASADO";
+      }
+    }
+
+    // ===== HUMOR (A-D) =====
+    Serial.println("Introduz humor: A=Otimo B=Bom C=Razoavel D=Mau (10 seg)");
+    int humor = 2;
+    unsigned long tempoInicio = millis();
+    bool introduzido = false;
+
+    while (millis() - tempoInicio < 10000) {
+      esp_task_wdt_reset();
+      char tecla = keypad.getKey();
+      if (tecla == 'A' || tecla == 'B' || tecla == 'C' || tecla == 'D') {
+        humor = charParaHumor(tecla);
+        introduzido = true;
+        Serial.println("Humor: " + getNomeHumor(humor));
+        break;
+      }
+      WiFiClient client = server.available();
+      if (client) tratarPedidoWeb(client);
+      yield();
+      delay(50);
+    }
+    if (!introduzido) Serial.println("Tempo esgotado! Humor padrao: Bom");
+
+    // ===== MOTIVO ATRASO =====
+    String motivo = "";
+    if (estado == "ATRASADO") {
+      Serial.println("Motivo: 1=Autocarro 2=Fila bar 3=Sai tarde 4=Transito (10 seg)");
+      tempoInicio = millis();
+      introduzido = false;
+      while (millis() - tempoInicio < 10000) {
+        esp_task_wdt_reset();
+        char tecla = keypad.getKey();
+        if (tecla >= '1' && tecla <= '4') {
+          motivo = motivosAtraso[tecla - '0'];
+          introduzido = true;
+          Serial.println("Motivo: " + motivo);
+          break;
+        }
+        WiFiClient client = server.available();
+        if (client) tratarPedidoWeb(client);
+        yield();
+        delay(50);
+      }
+      if (!introduzido) { motivo = "Nao indicado"; Serial.println("Motivo nao indicado."); }
+      bip(2, 200);
+    } else if (estado == "OK") {
+      bip(1, 300);
+    } else {
+      bip(3, 80);
+    }
+
+    // ===== GUARDAR =====
+    String registo = nome + " - " + horaAtual + " - " + estado;
+    historico[totalRegistos].texto  = registo;
+    historico[totalRegistos].humor  = humor;
+    historico[totalRegistos].motivo = motivo;
+    totalRegistos++;
+    if (totalRegistos >= 20) totalRegistos = 0;
+
+    gravarNoSD(dataHora + "," + nome + "," + estado + "," + motivo + "," + getNomeHumor(humor));
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    delay(500);
+  }
+
+  WiFiClient client = server.available();
+  if (client) tratarPedidoWeb(client);
+}
